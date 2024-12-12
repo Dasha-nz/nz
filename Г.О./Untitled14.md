@@ -1,0 +1,451 @@
+```python
+!pip install gym
+```
+
+    Requirement already satisfied: gym in c:\users\dasha\anaconda3\lib\site-packages (0.26.2)
+    Requirement already satisfied: numpy>=1.18.0 in c:\users\dasha\anaconda3\lib\site-packages (from gym) (1.26.4)
+    Requirement already satisfied: cloudpickle>=1.2.0 in c:\users\dasha\anaconda3\lib\site-packages (from gym) (2.2.1)
+    Requirement already satisfied: gym_notices>=0.0.4 in c:\users\dasha\anaconda3\lib\site-packages (from gym) (0.0.8)
+    
+
+
+```python
+from collections import defaultdict
+import copy
+import sys
+import time
+
+import numpy as np
+import pyglet
+from pyglet.gl import *
+```
+
+
+```python
+# Grid cell state and color mapping
+EMPTY = BLACK = 0
+WALL = GRAY = 1
+AGENT = BLUE = 2
+BOMB = RED = 3
+GOAL = GREEN = 4
+```
+
+
+```python
+# RGB color value table
+COLOR_MAP = {
+    BLACK: [0.0, 0.0, 0.0],
+    GRAY: [0.5, 0.5, 0.5],
+    BLUE: [0.0, 0.0, 1.0],
+    RED: [1.0, 0.0, 0.0],
+    GREEN: [0.0, 1.0, 0.0],
+}
+```
+
+
+```python
+# Action mapping
+NOOP = 0
+DOWN = 1
+UP = 2
+LEFT = 3
+RIGHT = 4
+```
+
+
+```python
+def get_window(width, height, display, **kwargs):
+    """
+    Will create a pyglet window from the display specification provided
+    """
+    screen = display.get_screens()  # available screens
+    config = screen[0].get_best_config()  # selecting the first screen
+    context = config.create_context(None)  # create GL context
+
+    return pyglet.window.Window(
+        width=width,
+        height=height,
+        display=display,
+        config=config,
+        context=context,
+        **kwargs
+    )
+
+def get_display(spec):
+    """Convert a display specification (such as :0) 
+    into an actual Display object.
+    Pyglet only supports multiple Displays on Linux.
+    """
+    if spec is None:
+        return pyglet.canvas.get_display()
+        # returns already available pyglet_display,
+        # if there is no pyglet display available then it creates one
+    elif isinstance(spec, str):
+        return pyglet.canvas.Display(spec)
+    else:
+        raise error.Error(
+            "Invalid display specification: {}. "+
+            "(Must be a string like :0 or None.)".format(
+                spec
+            )
+        )
+
+class SimpleImageViewer(object):
+    def __init__(self, display=None, maxwidth=500):
+        self.window = None
+        self.isopen = False
+        self.display = get_display(display)
+        self.maxwidth = maxwidth
+
+    def imshow(self, arr):
+        if self.window is None:
+            height, width, _channels = arr.shape
+            if width > self.maxwidth:
+                scale = self.maxwidth / width
+                width = int(scale * width)
+                height = int(scale * height)
+            self.window = get_window(
+                width=width,
+                height=height,
+                display=self.display,
+                vsync=False,
+                resizable=True,
+            )
+            self.width = width
+            self.height = height
+            self.isopen = True
+
+            @self.window.event
+            def on_resize(width, height):
+                self.width = width
+                self.height = height
+
+            @self.window.event
+            def on_close():
+                self.isopen = False
+
+        assert len(arr.shape) == 3, \
+            "You passed in an image with the wrong number shape"
+        image = pyglet.image.ImageData(
+            arr.shape[1], arr.shape[0], "RGB", arr.tobytes(), 
+            pitch=arr.shape[1] * -3
+        )
+        texture = image.get_texture()
+        gl.glTexParameteri(gl.GL_TEXTURE_2D, 
+                           gl.GL_TEXTURE_MAG_FILTER, 
+                           gl.GL_NEAREST
+                          )
+        texture.width = self.width
+        texture.height = self.height
+        self.window.clear()
+        self.window.switch_to()
+        self.window.dispatch_events()
+        texture.blit(0, 0)  # draw
+        self.window.flip()
+        
+    def close(self):   
+        self.isopen = False
+```
+
+
+```python
+import gym
+class GridworldEnv(gym.Env):
+    # Конструктор __init__ определяет необходимые свойства класса, 
+    # включая пространство наблюдения и пространство действий
+    def __init__(self, max_steps=100):
+        """Initialize Gridworld
+
+        Args:
+            max_steps (int, optional): Max steps per episode. 
+            Defaults to 100.
+        """
+        # Observations
+        # Определим макет среды Gridworld, используя отображение 
+        # состояний ячеек сетки
+        self.grid_layout = """
+        1 1 1 1 1 1 1 1
+        1 4 1 0 0 0 0 1
+        1 0 0 0 3 0 0 1
+        1 1 0 0 1 0 0 1
+        1 0 0 0 0 0 0 1
+        1 1 1 1 0 1 1 1
+        1 3 0 0 0 0 2 1
+        1 1 1 1 1 1 1 1
+        """
+        # Здесь 0 соответствует пустым ячейкам, 1 соответствует стенам, 
+        # 2 соответствует стартовому местоположению агента, 
+        # 3 соответствует местоположению мины/бомбы/препятствия, 
+        # а 4 соответствует местоположению цели на основе карты.
+        # Теперь построим пространство наблюдения для среды 
+        # Gridworld RL:
+        self.initial_grid_state = np.fromstring(self.grid_layout, 
+                                                dtype=int, sep=" ")
+        self.initial_grid_state = self.initial_grid_state.reshape(8, 8)
+        self.grid_state = copy.deepcopy(self.initial_grid_state)
+        self.observation_space = gym.spaces.Box(
+            low=0, high=6, shape=self.grid_state.shape
+        )
+        self.img_shape = [256, 256, 3]
+        self.metadata = {"render.modes": ["human"]}
+        # Actions
+        # Определим пространство действий и сопоставление 
+        # между действиями и движением агента в сетке:
+        self.action_space = gym.spaces.Discrete(5)
+        self.actions = [NOOP, UP, DOWN, LEFT, RIGHT]
+        self.action_pos_dict = defaultdict(
+            lambda: [0, 0],
+            {
+                NOOP: [0, 0],
+                UP: [-1, 0],
+                DOWN: [1, 0],
+                LEFT: [0, -1],
+                RIGHT: [0, 1],
+            },
+        )
+        # Завершим функцию __init__, инициализируя начальное и целевое 
+        # состояния агента с помощью метода get_state() 
+        (self.agent_state, self.goal_state) = self.get_state()
+        self.step_num = 0  # To keep track of number of steps
+        self.max_steps = max_steps
+        self.done = False
+        self.info = {"status": "Live"}
+        self.viewer = None
+
+    # Реализуем метод step для выполнения действия и получения 
+    # следующего состояния/наблюдения, связанной награды и того, 
+    # закончился ли эпизод:
+    def step(self, action):
+        """Return next observation, reward, done , info"""
+        action = int(action)
+        reward = 0.0
+
+        next_state = (
+            self.agent_state[0] + self.action_pos_dict[action][0],
+            self.agent_state[1] + self.action_pos_dict[action][1],
+        )
+
+        next_state_invalid = (
+            next_state[0] < 0 or next_state[0] >= 
+            self.grid_state.shape[0]
+        ) or (next_state[1] < 0 or next_state[1] >= 
+              self.grid_state.shape[1])
+        if next_state_invalid:
+            # Leave the agent state unchanged
+            next_state = self.agent_state
+            self.info["status"] = "Next state is invalid"
+
+        next_agent_state = self.grid_state[next_state[0], 
+                                           next_state[1]]
+
+        # Calculate reward
+        if next_agent_state == EMPTY:
+            # Move agent from previous state to the next state 
+            # on the grid
+            self.info["status"] = "Agent moved to a new cell"
+            self.grid_state[next_state[0], next_state[1]] = AGENT
+            self.grid_state[self.agent_state[0], 
+                            self.agent_state[1]] = EMPTY
+            self.agent_state = copy.deepcopy(next_state)
+
+        elif next_agent_state == WALL:
+            self.info["status"] = "Agent bumped into a wall"
+            reward = -0.1
+        # Terminal states
+        elif next_agent_state == GOAL:
+            self.info["status"] = "Agent reached the GOAL "
+            self.done = True
+            reward = 1
+        elif next_agent_state == BOMB:
+            self.info["status"] = "Agent stepped on a BOMB"
+            self.done = True
+            reward = -1
+        # elif next_agent_state == AGENT:
+        else:
+            # NOOP or next state is invalid
+            self.done = False
+
+        self.step_num += 1
+
+        # Check if max steps per episode has been reached
+        if self.step_num >= self.max_steps:
+            self.done = True
+            self.info["status"] = "Max steps reached"
+
+        if self.done:
+            done = True
+            terminal_state = copy.deepcopy(self.grid_state)
+            terminal_info = copy.deepcopy(self.info)
+            _ = self.reset()
+            return (terminal_state, reward, done, terminal_info)
+
+        return self.grid_state, reward, self.done, self.info
+
+    # Далее идет метод reset(), который сбрасывает среду Gridworld 
+    # после завершения эпизода или если делается запрос на сброс среды
+    def reset(self):
+        self.grid_state = copy.deepcopy(self.initial_grid_state)
+        (
+            self.agent_state,
+            self.agent_goal_state,
+        ) = self.get_state()
+        self.step_num = 0
+        self.done = False
+        self.info["status"] = "Live"
+        return self.grid_state
+
+    # Теперь реализуем метод get_state(), который возвращает 
+    # начальное и конечное состояние среды Gridworld
+    def get_state(self):
+        start_state = np.where(self.grid_state == AGENT)
+        goal_state = np.where(self.grid_state == GOAL)
+
+        start_or_goal_not_found = not (start_state[0] and goal_state[0])
+        if start_or_goal_not_found:
+            sys.exit(
+                "Start and/or Goal state not present in the Gridworld."
+                "Check the Grid layout"
+            )
+        start_state = (start_state[0][0], start_state[1][0])
+        goal_state = (goal_state[0][0], goal_state[1][0])
+
+        return start_state, goal_state
+
+    # Чтобы визуализировать состояние среды Gridworld удобным 
+    # для человека способом, реализуем функцию рендеринга, которая 
+    # преобразует Grid_layout в изображение и отображает его. 
+    def gridarray_to_image(self, img_shape=None):
+        if img_shape is None:
+            img_shape = self.img_shape
+        observation = np.random.randn(*img_shape) * 0.0
+        scale_x = int(observation.shape[0] / self.grid_state.shape[0])
+        scale_y = int(observation.shape[1] / self.grid_state.shape[1])
+        for i in range(self.grid_state.shape[0]):
+            for j in range(self.grid_state.shape[1]):
+                for k in range(3):  # 3-channel RGB image
+                    pixel_value = COLOR_MAP[self.grid_state[i, j]][k]
+                    observation[
+                        i * scale_x : (i + 1) * scale_x,
+                        j * scale_y : (j + 1) * scale_y,
+                        k,
+                    ] = pixel_value
+        return (255 * observation).astype(np.uint8)
+
+    def render(self, mode="human", close=False):
+        if close:
+            if self.viewer is not None:
+                self.viewer.close()
+                self.viewer = None
+            return
+
+        img = self.gridarray_to_image()
+        if mode == "rgb_array":
+            return img
+        elif mode == "human":
+            #from gymnasium.envs.classic_control import rendering
+
+            if self.viewer is None:
+                #rendering.SimpleImageViewer()
+                self.viewer = SimpleImageViewer() 
+            self.viewer.imshow(img)
+
+    def close(self):
+        self.render(close=True)
+
+    @staticmethod
+    def get_action_meanings():
+        return ["NOOP ", "DOWN ", "UP   ", "LEFT ", "RIGHT"]
+
+```
+
+
+```python
+env = GridworldEnv()
+obs = env.reset()
+done = False
+step_num = 1
+# Run one episode
+while not done:
+    # Sample a random action from the action space
+    action = env.action_space.sample()
+    print(f"#:{step_num:2d}", env.get_state()[0],
+          env.get_action_meanings()[action], end=' ')
+    next_obs, reward, done, info = env.step(action)
+    print(f"reward:{reward} info:{info}")
+    step_num += 1
+    env.render()
+    time.sleep(0.5)
+env.close()
+
+```
+
+    #: 1 (6, 6) NOOP  reward:0.0 info:{'status': 'Live'}
+    #: 2 (6, 6) NOOP  reward:0.0 info:{'status': 'Live'}
+    #: 3 (6, 6) NOOP  reward:0.0 info:{'status': 'Live'}
+    #: 4 (6, 6) LEFT  reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #: 5 (6, 5) LEFT  reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #: 6 (6, 4) NOOP  reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #: 7 (6, 4) UP    reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #: 8 (5, 4) NOOP  reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #: 9 (5, 4) DOWN  reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:10 (6, 4) DOWN  reward:-0.1 info:{'status': 'Agent bumped into a wall'}
+    #:11 (6, 4) LEFT  reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:12 (6, 3) UP    reward:-0.1 info:{'status': 'Agent bumped into a wall'}
+    #:13 (6, 3) RIGHT reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:14 (6, 4) RIGHT reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:15 (6, 5) UP    reward:-0.1 info:{'status': 'Agent bumped into a wall'}
+    #:16 (6, 5) DOWN  reward:-0.1 info:{'status': 'Agent bumped into a wall'}
+    #:17 (6, 5) LEFT  reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:18 (6, 4) RIGHT reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:19 (6, 5) LEFT  reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:20 (6, 4) UP    reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:21 (5, 4) LEFT  reward:-0.1 info:{'status': 'Agent bumped into a wall'}
+    #:22 (5, 4) UP    reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:23 (4, 4) DOWN  reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:24 (5, 4) DOWN  reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:25 (6, 4) NOOP  reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:26 (6, 4) UP    reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:27 (5, 4) NOOP  reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:28 (5, 4) RIGHT reward:-0.1 info:{'status': 'Agent bumped into a wall'}
+    #:29 (5, 4) LEFT  reward:-0.1 info:{'status': 'Agent bumped into a wall'}
+    #:30 (5, 4) DOWN  reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:31 (6, 4) UP    reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:32 (5, 4) DOWN  reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:33 (6, 4) LEFT  reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:34 (6, 3) LEFT  reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:35 (6, 2) UP    reward:-0.1 info:{'status': 'Agent bumped into a wall'}
+    #:36 (6, 2) UP    reward:-0.1 info:{'status': 'Agent bumped into a wall'}
+    #:37 (6, 2) NOOP  reward:0.0 info:{'status': 'Agent bumped into a wall'}
+    #:38 (6, 2) RIGHT reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:39 (6, 3) RIGHT reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:40 (6, 4) DOWN  reward:-0.1 info:{'status': 'Agent bumped into a wall'}
+    #:41 (6, 4) NOOP  reward:0.0 info:{'status': 'Agent bumped into a wall'}
+    #:42 (6, 4) UP    reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:43 (5, 4) DOWN  reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:44 (6, 4) LEFT  reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:45 (6, 3) RIGHT reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:46 (6, 4) RIGHT reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:47 (6, 5) NOOP  reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:48 (6, 5) RIGHT reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:49 (6, 6) DOWN  reward:-0.1 info:{'status': 'Agent bumped into a wall'}
+    #:50 (6, 6) RIGHT reward:-0.1 info:{'status': 'Agent bumped into a wall'}
+    #:51 (6, 6) LEFT  reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:52 (6, 5) LEFT  reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:53 (6, 4) NOOP  reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:54 (6, 4) LEFT  reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:55 (6, 3) UP    reward:-0.1 info:{'status': 'Agent bumped into a wall'}
+    #:56 (6, 3) DOWN  reward:-0.1 info:{'status': 'Agent bumped into a wall'}
+    #:57 (6, 3) RIGHT reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:58 (6, 4) UP    reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:59 (5, 4) LEFT  reward:-0.1 info:{'status': 'Agent bumped into a wall'}
+    #:60 (5, 4) RIGHT reward:-0.1 info:{'status': 'Agent bumped into a wall'}
+    #:61 (5, 4) LEFT  reward:-0.1 info:{'status': 'Agent bumped into a wall'}
+    #:62 (5, 4) DOWN  reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:63 (6, 4) LEFT  reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:64 (6, 3) NOOP  reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:65 (6, 3) LEFT  reward:0.0 info:{'status': 'Agent moved to a new cell'}
+    #:66 (6, 2) UP    reward:-0.1 info:{'status': 'Agent bumped into a wall'}
+    #:67 (6, 2) LEFT  reward:-1 info:{'status': 'Agent stepped on a BOMB'}
+    
+
+
